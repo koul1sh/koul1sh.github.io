@@ -144,141 +144,128 @@ A useful rule of thumb: **inspect `actual rows × loops` to understand the total
 
 ### What about joins?
 
-Let's take a slightly more interesting example.
+Let's take a real example.
 
-Suppose we have two tables:
+We have two tables:
 
-- `customers`: Contains customer information.
-- `orders`: Contains all orders placed by customers.
+- `package`: One row per package, with columns like `franchise_id` and `created_on`.
+- `package_tracking`: Tracking information for each package, with columns like `estimated_delivery_date`, `payment_due_date` and `estimated_return_date`.
 
-We want to fetch the orders belonging to customers from a particular city.
+A lot of our queries fetch package details using those tracking dates. One of them looks like this: get all packages of a franchise with an estimated delivery date in the next 30 days.
 
 ```sql
 SELECT
-    c.id,
-    c.name,
-    o.id AS order_id,
-    o.total_amount
-FROM customers c
-JOIN orders o
-    ON o.customer_id = c.id
-WHERE c.city = 'Pune';
+    p.id,
+    p.tracking_number,
+    pt.estimated_delivery_date
+FROM package p
+JOIN package_tracking pt
+    ON pt.package_id = p.id
+WHERE p.franchise_id = 42
+  AND pt.estimated_delivery_date
+      BETWEEN CURDATE() AND CURDATE() + INTERVAL 30 DAY;
 ```
 
-Now run:
+Looks harmless. There's an index on `package.franchise_id` and an index on `package_tracking.package_id`. Let's put `EXPLAIN ANALYZE` in front of it and see what MySQL gives us. Something like this:
 
-```sql
-EXPLAIN ANALYZE
-SELECT
-    c.id,
-    c.name,
-    o.id AS order_id,
-    o.total_amount
-FROM customers c
-JOIN orders o
-    ON o.customer_id = c.id
-WHERE c.city = 'Pune';
+```text
+-> Nested loop inner join
+   (actual time=0.9..2140 rows=1800 loops=1)
+    -> Index lookup on p using idx_package_franchise_id (franchise_id=42)
+       (actual time=0.5..310 rows=250000 loops=1)
+    -> Filter: (pt.estimated_delivery_date between ...)
+       (actual time=0.007..0.007 rows=0.0072 loops=250000)
+        -> Index lookup on pt using idx_package_tracking_package_id (package_id=p.id)
+           (actual time=0.006..0.006 rows=1 loops=250000)
 ```
 
 There are a few things we want to inspect here.
 
-**1. Join order**
+**1. Join order:** MySQL starts from `package` and then goes to `package_tracking`. The optimizer decides this order based on its estimates and the available indexes, not on the order we wrote the tables in.
 
-Which table does MySQL access first?
+**2. Access method:** Both tables use index lookups. No table scans. On the surface, everything looks fine.
 
-The query is written with `customers` first, but that doesn't mean MySQL must execute it in that order. The optimizer decides the execution order based on its estimates, available indexes and other information.
+**3. Rows and loops:** This is where it falls apart. The lookup on `package` returns 250,000 rows, every package this franchise has ever had. Then the lookup on `package_tracking` runs 250,000 times (`loops=250000`), once for each of those packages. Only after fetching the tracking row does MySQL apply the date filter, and almost everything gets thrown away. `rows=0.0072` per loop × 250,000 loops ≈ 1,800 rows.
 
-**2. Access method**
-
-Is MySQL scanning the entire table, using an index lookup, or using some other access method?
-
-**3. Rows and loops**
-
-How many rows are being produced at each stage? How many times is an operation being executed?
-
-These details can tell us whether the join is doing more work than necessary.
+We're doing 250,000 lookups to return 1,800 rows.
 
 #### Understanding nested-loop joins
 
-One commonly used join strategy is the nested-loop join.
-
-Think of it this way:
+This is how a nested-loop join works:
 
 1. Fetch M rows from table A.
 2. For every row fetched from A, look for matching rows in table B.
 3. Repeat until all M rows have been processed.
 
-If we fetch 1,000 rows from A and perform a lookup in B for every row, we're potentially doing 1,000 lookups into B.
+The cost depends mostly on M. Here, A is `package`, and M is every package of the franchise, because the only filter MySQL can apply to `package` is `franchise_id`. The date filter lives in the other table, so it can only be applied after the join.
 
-Now imagine we could reduce those 1,000 rows to just 50. That's significantly less work for the database.
+You might think: why not start from `package_tracking` instead, using an index on `estimated_delivery_date`? MySQL can do that, but then it has the opposite problem. It fetches packages due in the next 30 days for *every* franchise, then looks up each package just to discard the ones from other franchises. Either way, one of the two filters gets applied too late.
 
-There are two ways we can approach this.
+So there are two levers:
 
-**1. Reduce the number of rows fetched from the first table.**
+1. **Reduce the number of rows fetched from the first table.**
+2. **Make sure the matching rows in the second table can be found efficiently.**
 
-Let's say we have the following query:
+The second one is already taken care of. Each lookup into `package_tracking` uses an index and is cheap. The problem is purely that we do it 250,000 times.
 
-```sql
-SELECT
-    c.id,
-    c.name,
-    o.id AS order_id
-FROM customers c
-JOIN orders o
-    ON o.customer_id = c.id;
-```
+#### Reducing the rows from the first table
 
-We're fetching orders for every customer.
+The question I asked was: is there anything on the `package` table that tells me a package can't possibly be delivered in the next 30 days?
 
-But suppose our actual requirement is to fetch orders only for customers from Pune.
+There was. A package created years ago isn't going to have an estimated delivery date next month. In our case, it was safe to say that any package with an upcoming delivery date was created within the last year.
 
-Adding a filter:
+So I added a filter on `created_on`:
 
 ```sql
 SELECT
-    c.id,
-    c.name,
-    o.id AS order_id
-FROM customers c
-JOIN orders o
-    ON o.customer_id = c.id
-WHERE c.city = 'Pune';
+    p.id,
+    p.tracking_number,
+    pt.estimated_delivery_date
+FROM package p
+JOIN package_tracking pt
+    ON pt.package_id = p.id
+WHERE p.franchise_id = 42
+  AND p.created_on >= CURDATE() - INTERVAL 1 YEAR
+  AND pt.estimated_delivery_date
+      BETWEEN CURDATE() AND CURDATE() + INTERVAL 30 DAY;
 ```
 
-allows MySQL to narrow down the customer set before performing the corresponding lookups, provided the optimizer chooses that execution strategy.
-
-An index on `customers.city` can help locate those customers efficiently:
+With a composite index to support it:
 
 ```sql
-CREATE INDEX idx_customers_city
-ON customers(city);
+CREATE INDEX idx_package_franchise_created
+ON package(franchise_id, created_on);
 ```
 
-**2. Make sure the matching rows in the second table can be found efficiently.**
+Now MySQL can narrow down the packages before it starts the join:
 
-For our join, we're looking up orders using `customer_id`.
+```text
+-> Nested loop inner join
+   (actual time=0.8..410 rows=1800 loops=1)
+    -> Index range scan on p using idx_package_franchise_created
+       over (franchise_id = 42 AND created_on >= ...)
+       (actual time=0.4..60 rows=45000 loops=1)
+    -> Filter: (pt.estimated_delivery_date between ...)
+       (actual time=0.007..0.007 rows=0.04 loops=45000)
+        -> Index lookup on pt using idx_package_tracking_package_id (package_id=p.id)
+           (actual time=0.006..0.006 rows=1 loops=45000)
+```
 
-If there is no suitable index on `orders.customer_id`, MySQL may have to perform expensive scans to find matching orders.
+Same 1,800 rows, but 45,000 lookups instead of 250,000.
 
-This is where the `idx_orders_customer_id` index we created earlier pays off again. Now MySQL can use that index to find the orders belonging to each customer instead of repeatedly scanning the entire `orders` table.
+The filter looks redundant. Logically, the date condition on `package_tracking` already decides which rows come back. But MySQL can't apply that condition until after the join. The `created_on` condition can be applied *before* it, using an index. The idea is to filter out unnecessary rows as early as possible rather than carrying them through the join.
 
-The important thing is that reducing the number of rows processed and making subsequent lookups efficient work together.
+One big caveat: **this filter is only correct because of a business rule.** If a package can ever be created more than a year before its delivery date, this query silently drops it. No error, just missing data. So make sure the assumption actually holds, and leave a comment next to the query explaining why the filter is there. Otherwise someone will either remove it as "useless" or keep it after the rule changes.
 
-One more thing: MySQL doesn't always use nested-loop joins. Depending on the query and available indexes, it can choose other strategies, including hash joins. So don't assume every join needs to be optimized in the same way.
-
-Also, don't blindly force a join order just because it looks better in your SQL. First understand why the optimizer chose its execution plan. If its estimates are wrong, investigate the statistics and data distribution before forcing a different plan.
+Also, don't blindly add filters everywhere. MySQL's optimizer can already push down and derive some conditions on its own. Check whether the extra condition actually changes the execution plan and reduces the work being done.
 
 That's why EXPLAIN ANALYZE is so useful. It helps us move beyond guessing and understand what MySQL is actually doing.
 
 ### Sometimes, the problem isn't the query
 
-While optimizing queries, we sometimes add additional filters, even ones that might seem redundant at first glance, to narrow down the rows being processed.
+The `created_on` trick worked because we had a column on `package` that loosely tracked the dates we cared about.
 
-The idea is to filter out unnecessary rows as early as possible rather than carrying them through multiple joins and operations.
-
-Of course, MySQL's optimizer can already perform optimizations like predicate pushdown and derive some conditions on its own. So don't blindly add filters everywhere. Check whether the additional condition actually changes the execution plan and reduces the work being done.
-
-But what if you've tried all of this?
+But what if you don't have one? Or what if the query is on `payment_due_date`, and some payments are due years after the package was created?
 
 You've optimized the query, added appropriate indexes, investigated the join order, and checked the execution plan. And yet, the query is still doing way too much work.
 
@@ -286,62 +273,64 @@ You've optimized the query, added appropriate indexes, investigated the join ord
 
 Maybe it's time to look beyond the query itself.
 
-Sometimes, the problem lies in how we've designed our schema.
+Look at what the query actually needs: packages of *one franchise* with *a date in some range*. The franchise is on one table, and the date is on another. No index can span two tables, so no single index can answer this query. MySQL will always have to over-fetch on one side and filter on the other.
 
-Let's take an example.
+That's a schema problem, not a query problem.
 
-Suppose we have an `orders` table and a `customers` table. Every time we fetch orders, we also need to filter them by the customer's city.
-
-Our query looks something like this:
+The fix is to get both columns into the same table. For example, add `franchise_id` to `package_tracking`:
 
 ```sql
-SELECT o.*
-FROM orders o
-JOIN customers c ON c.id = o.customer_id
-WHERE c.city = 'Pune'
-  AND o.status = 'pending';
+ALTER TABLE package_tracking
+ADD COLUMN franchise_id INT NOT NULL;
+
+CREATE INDEX idx_tracking_franchise_edd
+ON package_tracking(franchise_id, estimated_delivery_date);
 ```
 
-Now imagine this is a very frequent query in our application, and we have millions of orders.
-
-Even with appropriate indexes on `customers.city`, `orders.customer_id` and `orders.status`, we're still dealing with a join to retrieve information that we frequently need for filtering.
-
-One possible approach is to reconsider the schema.
-
-For example, if the application frequently needs to filter orders by customer city, we could maintain a `customer_city` column in the `orders` table:
+Now the query can filter on `package_tracking` alone:
 
 ```sql
-SELECT *
-FROM orders
-WHERE customer_city = 'Pune'
-  AND status = 'pending';
+SELECT
+    p.id,
+    p.tracking_number,
+    pt.estimated_delivery_date
+FROM package_tracking pt
+JOIN package p
+    ON p.id = pt.package_id
+WHERE pt.franchise_id = 42
+  AND pt.estimated_delivery_date
+      BETWEEN CURDATE() AND CURDATE() + INTERVAL 30 DAY;
 ```
 
-Now we can create a composite index:
+And the plan becomes:
 
-```sql
-CREATE INDEX idx_orders_city_status
-ON orders(customer_city, status);
+```text
+-> Nested loop inner join
+   (actual time=0.3..25 rows=1800 loops=1)
+    -> Index range scan on pt using idx_tracking_franchise_edd
+       over (franchise_id = 42 AND ... <= estimated_delivery_date <= ...)
+       (actual time=0.2..4 rows=1800 loops=1)
+    -> Single-row index lookup on p using PRIMARY (id=pt.package_id)
+       (actual time=0.010..0.010 rows=1 loops=1800)
 ```
 
-This gives MySQL an opportunity to locate matching orders directly without joining the customers table for this particular query.
+MySQL reads exactly the 1,800 tracking rows it needs, and does 1,800 primary key lookups. No business-rule assumptions, and it works the same way for `payment_due_date` and `estimated_return_date` with their own composite indexes.
 
-Of course, we're now duplicating customer information in the orders table. If a customer's city changes, we need to make sure the corresponding orders are updated consistently. We're trading some write and maintenance complexity for a potentially cheaper read path.
+Of course, this isn't free:
 
-This is just one example of denormalization. Whether it makes sense depends on the workload, data consistency requirements and actual execution plans.
+- **We're duplicating data.** `franchise_id` now lives in two places, and both need to stay in sync. Luckily, a package rarely changes franchise, so this is a fairly cheap duplication. Duplicating something that changes often would be a very different story.
+- **It needs a migration.** Add the column, backfill it in batches for existing rows, and update every code path that inserts tracking rows. On a large table, adding a column and building indexes needs some care too.
+- **Every index has a write cost.** Three composite indexes, one per date column, means every insert and update on `package_tracking` has a bit more work to do.
 
-Other possibilities include:
+Whether it's worth it depends on how often these queries run and how much they cost. If date-based queries like these are all over your application, it probably is.
 
-- Frequently filtered columns might need to be moved or duplicated to better support common access patterns.
+This is just one example. Other common ones:
+
 - A frequently accessed attribute might be buried inside a large JSON column.
-- A heavily used query might benefit from a different composite index or access pattern.
-- A read-heavy workload might benefit from a denormalized representation or a summary table.
+- A list of IDs might be stored as a comma-separated string, which no index can help with.
+- A dashboard might aggregate millions of rows on every page load, when a summary table would do.
 
-Sometimes, this means changing the schema, moving columns, introducing summary tables, or reconsidering how we've organized our data.
-
-Obviously, schema changes aren't free. They introduce migration complexity, consistency concerns and additional maintenance.
-
-But there are cases where no amount of query rewriting will compensate for a data model that doesn't align with the application's access patterns.
+Schema changes introduce migration complexity, consistency concerns and additional maintenance. But there are cases where no amount of query rewriting will compensate for a data model that doesn't align with the application's access patterns.
 
 That's when it's worth stepping back and asking whether the problem is really the query, or the way we've modelled the data in the first place.
 
