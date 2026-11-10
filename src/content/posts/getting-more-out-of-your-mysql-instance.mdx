@@ -1,0 +1,409 @@
+---
+title: "Before You Scale It, EXPLAIN It"
+description: "Getting the most out of your existing MySQL instance by finding and fixing slow queries before reaching for replicas, sharding, or partitioning."
+pubDatetime: 2026-11-10T12:00:00Z
+tags: ["mysql", "databases", "performance"]
+math: false
+draft: false
+---
+
+## Why should we care about slow queries?
+
+The idea is simple: get as much as possible out of your existing database instances before adding another replica, sharding your data, partitioning tables, and whatnot.
+
+I know these things sound exciting and might even look good on your resume, but they also bring along a fair bit of complexity. More moving parts, more things to maintain, and more things that can go wrong.
+
+Before we go down that road, shouldn't we first make sure we're getting the most out of what we already have?
+
+A database has limited resources. CPU, memory, disk I/O, connections, all of it. Every query consumes some of these resources. If we're making the database scan a million rows when it only needs a few hundred, we're essentially making it do unnecessary work.
+
+And this adds up. Inefficient queries can occupy connections for longer, consume more CPU and I/O, and reduce the number of requests the database can handle efficiently.
+
+The idea is to make the database do less unnecessary work so it has more room to do the work that actually matters.
+
+## What causes slow queries?
+
+A few usual suspects:
+
+1. **Poorly written queries:** Fetching more data than necessary, inefficient joins, unnecessary operations, and so on.
+2. **Missing or improper indexes:** The database ends up scanning far more rows than it needs to because the available indexes don't align with the query.
+3. **Skewed data:** Sometimes the data distribution doesn't play nicely with the query optimizer, causing it to choose a suboptimal execution plan.
+4. **Resource contention:** Lock contention, high concurrency, CPU saturation, and disk I/O bottlenecks.
+5. **Application-level inefficiencies:** Sometimes the query itself isn't particularly bad. It's just being executed thousands of times because of how the application is written.
+
+## How I usually approach this
+
+My investigation generally follows four steps:
+
+1. **Find the expensive queries.** Figure out which query patterns are consuming the most resources. Execution time alone doesn't tell the whole story; frequency and cumulative execution time matter too.
+2. **Figure out what's going wrong.** Look at the execution plan, understand what the database is doing, and identify what could be improved.
+3. **Find where the query lives in the codebase.** A query doesn't magically appear in the database. Trace it back to the service or API that's generating it.
+4. **Fix it and see if it actually helped.** Make the change, deploy it, and compare the results. No point celebrating an optimization that only looks good on paper.
+
+### Finding the expensive queries
+
+First things first, check your logs.
+
+Since our databases run on AWS RDS, I usually start with CloudWatch. Head over to Database Insights / Performance Insights and look at the top SQL queries by wait activity.
+
+There are three metrics I usually pay attention to:
+
+1. **Calls/sec:** How frequently is this query being executed?
+2. **Average latency:** How much time does each execution take on average?
+3. **Rows read:** How many rows does the database have to read to execute the query?
+
+Don't look at these metrics in isolation. It's mostly the combination of all three that tells you where the actual problem is.
+
+For example, a query taking 200 ms might not look particularly bad. But if it's being executed 100 times per second, that's a lot of database work adding up.
+
+Similarly, a query might execute only a handful of times but take several seconds and read hundreds of thousands of rows. That's worth investigating too.
+
+The idea is to identify queries that are either consuming a disproportionate amount of database resources or contributing significantly to application latency.
+
+Once you have a shortlist, you know where to start digging instead of randomly opening SQL queries and hoping to find something interesting.
+
+### Now, what's wrong with the query?
+
+So you've identified an expensive query. What's next?
+
+Let's ask MySQL itself. Put two words before your SELECT query:
+
+```sql
+EXPLAIN ANALYZE
+SELECT *
+FROM orders
+WHERE customer_id = 101;
+```
+
+One important thing: **EXPLAIN ANALYZE actually executes the query.** It doesn't just show what MySQL plans to do. So be mindful when running it, especially against production databases. A query that takes a few seconds can still put unnecessary load on your database. Avoid blindly running expensive queries during peak traffic.
+
+#### How do we read the output?
+
+Let's take a simple example.
+
+Suppose our `orders` table contains a few million records, and we run the query above to fetch all orders belonging to a particular customer.
+
+Imagine MySQL gives us something like this:
+
+```text
+-> Filter: (orders.customer_id = 101)
+   (actual time=0.120..85.400 rows=120 loops=1)
+    -> Table scan on orders
+       (actual time=0.100..78.200 rows=1000000 loops=1)
+```
+
+Let's break this down.
+
+- **Table scan on orders:** MySQL is scanning the table instead of using an index to locate the relevant rows.
+- **rows=1000000:** The scan produced approximately one million rows for the filter operation.
+- **Filter:** MySQL applies the `customer_id` condition to those rows.
+- **rows=120:** Only 120 rows match our condition.
+- **actual time:** This shows the observed execution time for the operation. In this example, the scan takes around 78 ms, while the filter operation takes around 85 ms.
+
+We're scanning a million rows just to retrieve 120. That's a lot of unnecessary work.
+
+A suitable index on `customer_id` could help:
+
+```sql
+CREATE INDEX idx_orders_customer_id
+ON orders(customer_id);
+```
+
+Run EXPLAIN ANALYZE again and compare the execution plans.
+
+You should now see an index lookup instead of a full table scan, assuming the optimizer considers that index beneficial.
+
+That's a much better starting point.
+
+Also, don't just look at the `rows` value. Pay attention to `loops` too. An operation returning a few rows might be executed thousands of times as part of a nested-loop join. That's where things can get interesting.
+
+#### A small but important detail: rows × loops
+
+One thing I always pay attention to in EXPLAIN ANALYZE is the combination of `actual rows` and `loops`.
+
+In MySQL's tree-format output, actual rows and execution time are reported per loop. So if an operation returns 1 row but executes 50,000 times, that's potentially 50,000 rows being processed across those loops.
+
+For example:
+
+```text
+-> Index lookup on orders using idx_customer_id
+   (actual time=0.020..0.025 rows=1 loops=50000)
+```
+
+At first glance, returning just one row looks harmless. But look at the number of loops.
+
+We're performing that lookup 50,000 times!
+
+That's approximately 50,000 rows returned across all those executions. Even though each individual lookup is cheap, the cumulative cost can become significant.
+
+This is particularly important when investigating nested-loop joins, where an operation on the inner table can execute once for every row produced by the outer table.
+
+So don't just look at how many rows an operation returns. Look at how many times it's executed too.
+
+A useful rule of thumb: **inspect `actual rows × loops` to understand the total number of rows produced by an operation.** Remember, this isn't necessarily the number of physical disk reads. InnoDB might already have the relevant pages in its buffer pool.
+
+### What about joins?
+
+Let's take a slightly more interesting example.
+
+Suppose we have two tables:
+
+- `customers`: Contains customer information.
+- `orders`: Contains all orders placed by customers.
+
+We want to fetch the orders belonging to customers from a particular city.
+
+```sql
+SELECT
+    c.id,
+    c.name,
+    o.id AS order_id,
+    o.total_amount
+FROM customers c
+JOIN orders o
+    ON o.customer_id = c.id
+WHERE c.city = 'Pune';
+```
+
+Now run:
+
+```sql
+EXPLAIN ANALYZE
+SELECT
+    c.id,
+    c.name,
+    o.id AS order_id,
+    o.total_amount
+FROM customers c
+JOIN orders o
+    ON o.customer_id = c.id
+WHERE c.city = 'Pune';
+```
+
+There are a few things we want to inspect here.
+
+**1. Join order**
+
+Which table does MySQL access first?
+
+The query is written with `customers` first, but that doesn't mean MySQL must execute it in that order. The optimizer decides the execution order based on its estimates, available indexes and other information.
+
+**2. Access method**
+
+Is MySQL scanning the entire table, using an index lookup, or using some other access method?
+
+**3. Rows and loops**
+
+How many rows are being produced at each stage? How many times is an operation being executed?
+
+These details can tell us whether the join is doing more work than necessary.
+
+#### Understanding nested-loop joins
+
+One commonly used join strategy is the nested-loop join.
+
+Think of it this way:
+
+1. Fetch M rows from table A.
+2. For every row fetched from A, look for matching rows in table B.
+3. Repeat until all M rows have been processed.
+
+If we fetch 1,000 rows from A and perform a lookup in B for every row, we're potentially doing 1,000 lookups into B.
+
+Now imagine we could reduce those 1,000 rows to just 50. That's significantly less work for the database.
+
+There are two ways we can approach this.
+
+**1. Reduce the number of rows fetched from the first table.**
+
+Let's say we have the following query:
+
+```sql
+SELECT
+    c.id,
+    c.name,
+    o.id AS order_id
+FROM customers c
+JOIN orders o
+    ON o.customer_id = c.id;
+```
+
+We're fetching orders for every customer.
+
+But suppose our actual requirement is to fetch orders only for customers from Pune.
+
+Adding a filter:
+
+```sql
+SELECT
+    c.id,
+    c.name,
+    o.id AS order_id
+FROM customers c
+JOIN orders o
+    ON o.customer_id = c.id
+WHERE c.city = 'Pune';
+```
+
+allows MySQL to narrow down the customer set before performing the corresponding lookups, provided the optimizer chooses that execution strategy.
+
+An index on `customers.city` can help locate those customers efficiently:
+
+```sql
+CREATE INDEX idx_customers_city
+ON customers(city);
+```
+
+**2. Make sure the matching rows in the second table can be found efficiently.**
+
+For our join, we're looking up orders using `customer_id`.
+
+If there is no suitable index on `orders.customer_id`, MySQL may have to perform expensive scans to find matching orders.
+
+This is where the `idx_orders_customer_id` index we created earlier pays off again. Now MySQL can use that index to find the orders belonging to each customer instead of repeatedly scanning the entire `orders` table.
+
+The important thing is that reducing the number of rows processed and making subsequent lookups efficient work together.
+
+One more thing: MySQL doesn't always use nested-loop joins. Depending on the query and available indexes, it can choose other strategies, including hash joins. So don't assume every join needs to be optimized in the same way.
+
+Also, don't blindly force a join order just because it looks better in your SQL. First understand why the optimizer chose its execution plan. If its estimates are wrong, investigate the statistics and data distribution before forcing a different plan.
+
+That's why EXPLAIN ANALYZE is so useful. It helps us move beyond guessing and understand what MySQL is actually doing.
+
+### Sometimes, the problem isn't the query
+
+While optimizing queries, we sometimes add additional filters, even ones that might seem redundant at first glance, to narrow down the rows being processed.
+
+The idea is to filter out unnecessary rows as early as possible rather than carrying them through multiple joins and operations.
+
+Of course, MySQL's optimizer can already perform optimizations like predicate pushdown and derive some conditions on its own. So don't blindly add filters everywhere. Check whether the additional condition actually changes the execution plan and reduces the work being done.
+
+But what if you've tried all of this?
+
+You've optimized the query, added appropriate indexes, investigated the join order, and checked the execution plan. And yet, the query is still doing way too much work.
+
+![Napoleon looking at the battlefield: "There is nothing we can do"](../../assets/images/napoleon-battlefield.jpg)
+
+Maybe it's time to look beyond the query itself.
+
+Sometimes, the problem lies in how we've designed our schema.
+
+Let's take an example.
+
+Suppose we have an `orders` table and a `customers` table. Every time we fetch orders, we also need to filter them by the customer's city.
+
+Our query looks something like this:
+
+```sql
+SELECT o.*
+FROM orders o
+JOIN customers c ON c.id = o.customer_id
+WHERE c.city = 'Pune'
+  AND o.status = 'pending';
+```
+
+Now imagine this is a very frequent query in our application, and we have millions of orders.
+
+Even with appropriate indexes on `customers.city`, `orders.customer_id` and `orders.status`, we're still dealing with a join to retrieve information that we frequently need for filtering.
+
+One possible approach is to reconsider the schema.
+
+For example, if the application frequently needs to filter orders by customer city, we could maintain a `customer_city` column in the `orders` table:
+
+```sql
+SELECT *
+FROM orders
+WHERE customer_city = 'Pune'
+  AND status = 'pending';
+```
+
+Now we can create a composite index:
+
+```sql
+CREATE INDEX idx_orders_city_status
+ON orders(customer_city, status);
+```
+
+This gives MySQL an opportunity to locate matching orders directly without joining the customers table for this particular query.
+
+Of course, we're now duplicating customer information in the orders table. If a customer's city changes, we need to make sure the corresponding orders are updated consistently. We're trading some write and maintenance complexity for a potentially cheaper read path.
+
+This is just one example of denormalization. Whether it makes sense depends on the workload, data consistency requirements and actual execution plans.
+
+Other possibilities include:
+
+- Frequently filtered columns might need to be moved or duplicated to better support common access patterns.
+- A frequently accessed attribute might be buried inside a large JSON column.
+- A heavily used query might benefit from a different composite index or access pattern.
+- A read-heavy workload might benefit from a denormalized representation or a summary table.
+
+Sometimes, this means changing the schema, moving columns, introducing summary tables, or reconsidering how we've organized our data.
+
+Obviously, schema changes aren't free. They introduce migration complexity, consistency concerns and additional maintenance.
+
+But there are cases where no amount of query rewriting will compensate for a data model that doesn't align with the application's access patterns.
+
+That's when it's worth stepping back and asking whether the problem is really the query, or the way we've modelled the data in the first place.
+
+### Now, let's find where the query lives in our codebase
+
+We've identified the expensive query and have a fair idea of what's happening inside the database. Now comes the next question: where is this query being triggered from?
+
+A database query doesn't magically appear. Somewhere in our application, there's code responsible for executing it.
+
+This is where I'd start looking:
+
+1. **Find the source:** Search for the query in your codebase. If it's generated dynamically or through an ORM, use the query logs or tracing information to identify the service and code path responsible for it.
+2. **Check how frequently it's executed:** Is it being called once per API request, inside a loop, or multiple times for the same data?
+3. **Look for unnecessary database calls:** Are we fetching data that we don't need? Could multiple queries be combined into one? Are we running into an N+1 query problem?
+4. **Check pagination and filtering:** Are we fetching thousands of records when the application only needs a handful? Are we doing unnecessary processing in the application that the database could handle more efficiently?
+
+For example, imagine an API that fetches 100 orders and then executes another query for each order to fetch its customer details.
+
+That's potentially 101 database queries for a single API request!
+
+Depending on the use case, we might be able to fetch the required information using a single JOIN instead.
+
+The exact approach will vary depending on your application architecture, ORM and codebase. The important thing is to understand not just how expensive a query is, but also why the application is executing it in the first place.
+
+Sometimes the best database optimization isn't changing the SQL at all. It's fixing the application code that's generating it.
+
+### Fix it, deploy it and verify
+
+We've identified the expensive query, understood its execution plan, figured out what needs to change, and traced it back to our application.
+
+Now it's time to fix it.
+
+Make the required changes, whether that's adding an index, rewriting the query, changing the application logic, or modifying the schema.
+
+But we're not done yet.
+
+**Always verify the improvement after deploying the change.**
+
+Go back to the same metrics you used to identify the problem:
+
+- **Average latency:** Did the query become faster?
+- **Rows read:** Are we scanning fewer rows?
+- **Calls/sec:** Has the query frequency changed?
+- **Database load:** Are we consuming fewer resources?
+- **Application latency:** Did the API response time actually improve?
+
+Run EXPLAIN ANALYZE again and compare the execution plans wherever appropriate.
+
+Also, keep an eye on the side effects. Adding indexes can improve read performance but introduce additional overhead for writes. Changing the schema can introduce consistency and migration concerns.
+
+Don't optimize one query at the expense of the entire workload.
+
+And that's pretty much it. Database optimization is an iterative process. Find the expensive queries, understand why they're expensive, fix the underlying problem, and verify that things actually improved.
+
+No amount of clever SQL or fancy infrastructure matters if the database isn't doing its job efficiently.
+
+## A few final thoughts
+
+Scaling is sometimes necessary. But before adding replicas, sharding tables or throwing more resources at the database, it's worth spending some time understanding what's actually slowing it down.
+
+I've seen cases where a few changes to a query or an index were enough to make a noticeable difference. No new infrastructure, no complicated setup. Just fixing what was already there.
+
+And that's really the point of this whole exercise. Before making the database bigger, make sure it isn't doing unnecessary work.
+
+Happy optimizing!
